@@ -1,0 +1,724 @@
+`include "mycpu.h"
+module mycpu_top#(
+    parameter TLBNUM = 16
+)(
+    input          aclk,
+    input          aresetn,
+    // AXI interface
+    output [3 :0]  arid,
+    output [31:0]  araddr,
+    output [7 :0]  arlen,
+    output [2 :0]  arsize,
+    output [1 :0]  arburst,
+    output [1 :0]  arlock,
+    output [3 :0]  arcache,
+    output [2 :0]  arprot,
+    output         arvalid,
+    input          arready,
+
+    input [3 :0]   rid,
+    input [31:0]   rdata,
+    input [1 :0]   rresp,
+    input          rlast,
+    input          rvalid,
+    output         rready,
+
+    output [3 :0]  awid,
+    output [31:0]  awaddr,
+    output [7 :0]  awlen,
+    output [2 :0]  awsize,
+    output [1 :0]  awburst,
+    output [1 :0]  awlock,
+    output [3 :0]  awcache,
+    output [2 :0]  awprot,
+    output         awvalid,
+    input          awready,
+
+    output [3 :0]  wid,
+    output [31:0]  wdata,
+    output [3 :0]  wstrb,
+    output         wlast,
+    output         wvalid,
+    input          wready,
+
+    input [3 :0]   bid,
+    input [1 :0]   bresp,
+    input          bvalid,
+    output         bready,
+    // trace debug interface
+    output [31:0] debug_wb_pc,
+    output [ 3:0] debug_wb_rf_wen,
+    output [ 4:0] debug_wb_rf_wnum,
+    output [31:0] debug_wb_rf_wdata
+);
+wire        wb_tlb_reflush_top;
+reg         reset;
+always @(posedge aclk) reset <= ~aresetn; 
+wire        inst_sram_req;
+wire        inst_sram_wr;
+wire [ 1:0] inst_sram_size;
+wire [ 3:0] inst_sram_wstrb;
+wire [31:0] inst_sram_addr;
+wire [31:0] inst_sram_wdata;
+wire        inst_sram_addr_ok;
+wire        inst_sram_data_ok;
+wire [31:0] inst_sram_rdata;
+
+wire        data_sram_req;
+wire        data_sram_wr;
+wire [ 1:0] data_sram_size;
+wire [ 3:0] data_sram_wstrb;
+wire [31:0] data_sram_addr;
+wire [31:0] data_sram_wdata;
+wire        data_sram_addr_ok;
+wire        data_sram_data_ok;
+wire [31:0] data_sram_rdata;
+//handshake
+    wire         ds_allowin;
+    wire         es_allowin;
+    wire         ms_allowin;
+    wire         ws_allowin;
+    wire         fs_to_ds_valid;
+    wire         ds_to_es_valid;
+    wire         es_to_ms_valid;
+    wire         ms_to_ws_valid;
+//BUS
+    wire [`FS_TO_DS_BUS_WD -1:0] fs_to_ds_bus;
+    wire [`DS_TO_ES_BUS_WD -1:0] ds_to_es_bus;
+    wire [`ES_TO_MS_BUS_WD -1:0] es_to_ms_bus;
+    wire [`MS_TO_WS_BUS_WD -1:0] ms_to_ws_bus;
+    wire [`WS_TO_RF_BUS_WD -1:0] ws_to_rf_bus;
+    wire [`BR_BUS_WD       -1:0] br_bus;
+    wire [`DATA_RISK_BUS   -1:0] DATA_RISK_BUS;
+//DATA RISK
+    wire [4:0]  mem_waddr;
+    wire [4:0]  wb_waddr;
+    wire        exe_mem_load;
+    wire [4:0]  exe_mem_waddr;
+    wire [31:0] exe_wdata;
+    wire [4:0]  exe_waddr;
+    wire [31:0] mem_mem_result;
+    assign DATA_RISK_BUS = {exe_waddr, 
+                            mem_waddr, 
+                            wb_waddr, 
+                            exe_mem_load, 
+                            exe_mem_waddr, 
+                            exe_wdata, 
+                            mem_mem_result, 
+                            debug_wb_rf_wdata};
+                        //   5          5          5          1           5                32              32                32
+//CSR
+//READ & WRITE
+    wire [31:0] csr_rvalue_cntid_top;
+    wire csr_re_id;
+    wire has_int_top;
+    wire [7:0] hw_int_in_top = 8'b0;
+    wire ipi_int_in_top = 1'b0;
+    wire [31:0] csr_rvalue;
+    wire [31:0] csr_rvalue_cntvl_top;
+    wire [31:0] csr_rvalue_cntvh_top;
+    wire [31:0] csr_rvalue_eentry_top;
+    wire [31:0] csr_wmask;
+    wire [13:0] csr_num_exe;
+    wire [13:0] csr_num_mem;
+    wire csr_re_cntvl_top;
+    wire csr_re_cntvh_top;
+    wire csr_we_exe;
+    wire csr_we_mem;
+    wire csr_we_wb;
+    wire [13:0] csr_num_id_top;
+    wire [31:0] csr_wvalue_wb;
+    wire [13:0] csr_num_wb;
+    wire [31:0] csr_wmask_wb;
+    wire [31:0] ertn_era_wb;
+    wire [31:0] eentry_wb;
+    wire [31:0] wb_vaddr;
+    wire [5:0]  wb_ecode;
+    wire [8:0]  wb_esubcode;
+    wire [31:0] wb_pc;
+    wire ertn_flush_wb_top;
+    wire wb_ex_top;
+    wire clear_top = ertn_flush_wb_top || wb_ex_top;
+
+    wire mem_ex_top;
+    wire exe_ex_top;
+    wire clear_exe_top = mem_ex_top || wb_ex_top || ertn_flush_wb_top;
+    wire ertn_flush_mem_top;
+    wire inst_rdcntid_exe_top;
+    wire inst_rdcntid_mem_top;
+    wire inst_rdcntid_wb_top;
+    wire id_risk_rdcntid_top =  inst_rdcntid_exe_top | 
+                                inst_rdcntid_mem_top | 
+                                inst_rdcntid_wb_top ;
+    wire go_top;
+    wire ds_go_top;
+    wire exe_go_top;
+    wire [31:0] if_pc_top;
+    wire [31:0] id_pc_top;
+    wire [31:0] exe_pc_top;
+    wire [31:0] mem_pc_top;
+    wire [31:0] wb_pc_top;
+    wire flag_data_ok_top;
+    //tlb
+    wire [              18:0]    s0_vppn;
+    wire                         s0_va_bit12;
+    wire [               9:0]    s0_asid;
+    wire                         s0_found;
+    wire [$clog2(TLBNUM)-1:0]    s0_index;
+    wire [              19:0]    s0_ppn;
+    wire [               5:0]    s0_ps;
+    wire [               1:0]    s0_plv;
+    wire [               1:0]    s0_mat;
+    wire                         s0_d;
+    wire                         s0_v;
+        // search port 1 (for load/store)
+    wire  [              18:0]   s1_vppn;
+    wire                         s1_va_bit12;
+    wire  [               9:0]   s1_asid;
+    wire                         s1_found;
+    wire [$clog2(TLBNUM)-1:0]    s1_index;
+    wire [              19:0]    s1_ppn;
+    wire [               5:0]    s1_ps;
+    wire [               1:0]    s1_plv;
+    wire [               1:0]    s1_mat;
+    wire                         s1_d;
+    wire                         s1_v;
+        // invtlb opcode
+    wire                         invtlb_valid;
+    wire  [               4:0]   invtlb_op;
+        // write port
+    wire                         we; //w(rite) e(nable)
+    wire  [$clog2(TLBNUM)-1:0]   w_index;
+    wire                         w_e;
+    wire  [               5:0]   w_ps;
+    wire  [              18:0]   w_vppn;
+    wire  [               9:0]   w_asid;
+    wire                         w_g;
+    wire  [              19:0]   w_ppn0;
+    wire  [               1:0]   w_plv0;
+    wire  [               1:0]   w_mat0;
+    wire                         w_d0;
+    wire                         w_v0;
+    wire  [              19:0]   w_ppn1;
+    wire  [               1:0]   w_plv1;
+    wire  [               1:0]   w_mat1;
+    wire                         w_d1;
+    wire                         w_v1;
+        // read port
+    wire  [$clog2(TLBNUM)-1:0]   r_index;
+    wire                         r_e;
+    wire [              18:0]    r_vppn;
+    wire [               5:0]    r_ps;
+    wire [               9:0]    r_asid;
+    wire                         r_g;
+    wire [              19:0]    r_ppn0;
+    wire [               1:0]    r_plv0;
+    wire [               1:0]    r_mat0;
+    wire                         r_d0;
+    wire                         r_v0;
+    wire [              19:0]    r_ppn1;     
+    wire [               1:0]    r_plv1;
+    wire [               1:0]    r_mat1;
+    wire                         r_d1;
+    wire                         r_v1;
+// CSR
+    wire          tlb_refill_top;  
+    wire [5:0]    tlb_op_bus;
+    wire [5:0]    mem_tlb_op_top;
+    wire [5:0]    wb_tlb_op_top;
+    wire          tlbsrch_hit;
+    wire          csr_tlbrd;
+    wire [31:0]   csr_crmd_rvalue;
+    wire [31:0]   csr_tlbidx_rvalue;
+    wire [31:0]   csr_estat_rvalue;
+    wire [31:0]   csr_asid_rvalue;
+    wire [31:0]   csr_tlbehi_rvalue;
+    wire [31:0]   csr_tlbelo0_rvalue;
+    wire [31:0]   csr_tlbelo1_rvalue;
+    wire [31:0]   csr_asid_wvalue;
+    wire [31:0]   csr_dmw0_rvalue;
+    wire [31:0]   csr_dmw1_rvalue;
+    wire [31:0]   csr_tlbidx_wvalue_ex;
+    wire [31:0]   csr_tlbidx_wvalue;
+    wire [31:0]   csr_tlbelo0_wvalue;
+    wire [31:0]   csr_tlbelo1_wvalue;
+    wire [31:0]   csr_tlbehi_wvalue;
+    wire [31:0]   csr_tlbrentry_rvalue;
+    wire          change_da_pg;
+    wire          tlb_map_stop;
+    wire          fs_tlb_ex;
+    wire tlb_reflush_top = tlb_op_bus[5] | mem_tlb_op_top[5] | wb_tlb_op_top[5];
+    CSR CSR(
+        .fs_tlb_ex          (fs_tlb_ex          ),
+        .csr_rvalue_eentry  (csr_rvalue_eentry_top  ),
+        .csr_rvalue_cntid   (csr_rvalue_cntid_top   ),
+        .csr_rvalue_cntvl   (csr_rvalue_cntvl_top   ),
+        .csr_rvalue_cntvh   (csr_rvalue_cntvh_top   ),
+        .clk                (aclk                    ),
+        .ertn_flush         (ertn_flush_wb_top      ),
+        .reset              (reset                  ),
+        .csr_re             (csr_re_id              ),
+        .csr_we             (csr_we_wb              ),
+        .has_int            (has_int_top            ),
+        .hw_int_in          (hw_int_in_top          ),
+        .ipi_int_in         (ipi_int_in_top         ),
+        .wb_vaddr           (wb_vaddr               ),
+        .wb_ecode           (wb_ecode               ),
+        .wb_esubcode        (wb_esubcode            ),
+        .wb_pc              (wb_pc                  ),
+        .wb_ex              (wb_ex_top              ),
+        .change_da_pg       (change_da_pg           ),
+        .csr_num_r          (csr_num_id_top         ),
+        .csr_num            (csr_num_wb             ),
+        .csr_rvalue         (csr_rvalue             ),
+        .csr_wvalue         (csr_wvalue_wb          ),
+        .csr_wmask          (csr_wmask_wb           ),
+        .tlb_refill         (tlb_refill_top         ),
+        .tlb_op_bus         (tlb_op_bus             ), 
+        .tlbsrch_hit        (tlbsrch_hit            ),
+        .csr_tlbrd          (csr_tlbrd              ),
+        .csr_tlbidx_wvalue  (csr_tlbidx_wvalue      ),
+        .csr_tlbidx_wvalue_ex(csr_tlbidx_wvalue_ex  ),
+        .csr_tlbehi_wvalue  (csr_tlbehi_wvalue      ),
+        .csr_tlbelo0_wvalue (csr_tlbelo0_wvalue     ),
+        .csr_tlbelo1_wvalue (csr_tlbelo1_wvalue     ),
+        .csr_asid_wvalue    (csr_asid_wvalue        ),
+        .CRMD               (csr_crmd_rvalue        ),
+        .TLBIDX             (csr_tlbidx_rvalue      ),
+        .TLBEHI             (csr_tlbehi_rvalue      ),
+        .TLBELO0            (csr_tlbelo0_rvalue     ),
+        .TLBELO1            (csr_tlbelo1_rvalue     ),
+        .ASID               (csr_asid_rvalue        ),
+        .DMW0               (csr_dmw0_rvalue        ),
+        .DMW1               (csr_dmw1_rvalue        ),
+        .ESTAT              (csr_estat_rvalue       ),
+        .TLBRENTRY          (csr_tlbrentry_rvalue   )
+    );
+// IF stage
+    if_stage if_stage(
+        //.nextpc             (nextpc_top         ),
+        //.fs_tlb_ex          (fs_tlb_ex          ),
+        .wb_pc              (wb_pc_top          ),
+        .wb_tlb_reflush     (wb_tlb_reflush_top ),
+        .ertn_era_if        (ertn_era_wb        ),  
+        .eentry_wb          (eentry_wb          ),
+        .clear_w            (clear_top          ),
+        .wb_ex              (wb_ex_top          ),
+        .ertn_flush_wb      (ertn_flush_wb_top  ),
+  
+        .clk                (aclk               ),
+        .reset              (reset              ),
+        //allowin  
+        .ds_allowin         (ds_allowin         ),
+        //brbus  
+        .br_bus             (br_bus             ),
+        //outputs  
+        .fs_to_ds_valid     (fs_to_ds_valid     ),
+        .fs_to_ds_bus       (fs_to_ds_bus       ),
+        // inst sram interface
+        .inst_sram_req      (inst_sram_req      ),
+        .inst_sram_wr       (inst_sram_wr       ),
+        .inst_sram_size     (inst_sram_size     ),
+        .inst_sram_wstrb    (inst_sram_wstrb    ),
+        .inst_sram_addr     (inst_sram_addr     ),
+        .inst_sram_wdata    (inst_sram_wdata    ),
+        .inst_sram_addr_ok  (inst_sram_addr_ok  ),
+        .inst_sram_data_ok  (inst_sram_data_ok  ),
+        .inst_sram_rdata    (inst_sram_rdata    ),
+        .s0_vppn            (s0_vppn            ),
+        .s0_va_bit12        (s0_va_bit12        ),
+        .s0_asid            (s0_asid            ),
+        .s0_found           (s0_fount           ),
+        .s0_index           (s0_index           ),
+        .s0_ppn             (s0_ppn             ),  
+        .s0_ps              (s0_ps              ),
+        .s0_plv             (s0_plv             ),
+        .s0_mat             (s0_mat             ),
+        .s0_d               (s0_d               ),
+        .s0_v               (s0_v               ),
+        .csr_asid_rvalue    (csr_asid_rvalue    ),
+        .csr_crmd_rvalue    (csr_crmd_rvalue    ),
+        .csr_dmw0_rvalue    (csr_dmw0_rvalue    ),
+        .csr_dmw1_rvalue    (csr_dmw1_rvalue    )
+        //.tlb_risk_bus       (tlb_risk_bus       )   
+    );  
+// ID stage
+    wire [13:0] csr_num_exe_risk = csr_num_exe & {14{csr_we_exe}};
+    wire [13:0] csr_num_mem_risk = csr_num_mem & {14{csr_we_mem}};
+    wire [13:0] csr_num_wb_risk = csr_num_wb  & {14{csr_we_wb}};
+    id_stage id_stage(
+        .tlb_reflush        (tlb_reflush_top      ),
+        .inst_rdcntid_exe   (inst_rdcntid_exe_top ),
+        .inst_rdcntid_mem   (inst_rdcntid_mem_top ),
+        .inst_rdcntid_wb    (inst_rdcntid_wb_top  ),
+        .flag_data_ok       (flag_data_ok_top   ),
+        .ds_go              (ds_go_top          ),
+        .data_sram_data_ok  (data_sram_data_ok),
+        .ms_pc              (mem_pc_top         ),
+        .es_pc              (exe_pc_top         ),
+        .ws_pc              (wb_pc_top          ),
+        .ds_pc              (id_pc_top          ),
+        .exe_go             (exe_go_top         ),
+    //CSR
+        //in
+        .has_int        (has_int_top        ),
+        .mem_ex         (mem_ex_top         ),
+        .exe_ex         (exe_ex_top         ),
+        .csr_we_exe     (csr_we_exe         ),
+        .csr_we_mem     (csr_we_mem         ),
+        .csr_we_wb      (csr_we_wb          ),
+        .clear_w        (clear_top          ),
+        .csr_num_exe    (csr_num_exe_risk   ),
+        .csr_num_mem    (csr_num_mem_risk   ),
+        //out
+        .csr_rvalue     (csr_rvalue         ),
+        .csr_num_id     (csr_num_id_top     ),
+        .csr_num_wb     (csr_num_wb_risk    ),
+    //DATA_RISK_BUS
+        .DATA_RISK_BUS  (DATA_RISK_BUS      ),
+        .clk            (aclk                ),
+        .reset          (reset              ),
+    //allowin
+        .es_allowin     (es_allowin         ),
+        .ds_allowin     (ds_allowin         ),
+    //from fs
+        .fs_to_ds_valid (fs_to_ds_valid     ),
+        .fs_to_ds_bus   (fs_to_ds_bus       ),
+    //to es
+        .ds_to_es_valid (ds_to_es_valid     ),
+        .ds_to_es_bus   (ds_to_es_bus       ),
+    //to fs
+        .br_bus         (br_bus             ),
+    //to rf: for write back
+        .ws_to_rf_bus   (ws_to_rf_bus       )
+       // .tlb_risk_bus   (tlb_risk_bus       )
+    );
+//wire [32:0] tlb_risk_bus;
+// EXE stage
+    exe_stage exe_stage(
+        .tlb_map_stop       (tlb_map_stop       ),
+        .ds_go              (ds_go_top          ),
+        .es_pc              (exe_pc_top         ),
+        .exe_go             (exe_go_top         ),
+        //out
+        .inst_rdcntid_exe   (inst_rdcntid_exe_top),
+        .csr_rvalue_cntvh   (csr_rvalue_cntvh_top),
+        .csr_rvalue_cntvl   (csr_rvalue_cntvl_top),
+        .exe_ex         (exe_ex_top         ),
+        .csr_we_exe     (csr_we_exe         ),
+        .csr_num_exe    (csr_num_exe        ),
+        //in
+        .ertn_flush_mem (ertn_flush_mem_top ),
+        .mem_ex         (mem_ex_top         ),
+        .wb_ex          (wb_ex_top          ),
+        //.has_int        (has_int_top        ),//change
+        .ertn_flush_wb  (ertn_flush_wb_top      ),
+        .clear_w        (clear_exe_top      ),
+        //DATA_RISK_BUS
+        .exe_waddr      (exe_waddr      ),
+        .exe_mem_load   (exe_mem_load   ),
+        .exe_mem_waddr  (exe_mem_waddr  ),
+        .exe_wdata (exe_wdata ),
+        .clk            (aclk            ),
+        .reset          (reset          ),
+        //allowin
+        .ms_allowin     (ms_allowin     ),
+        .es_allowin     (es_allowin     ),
+        //from ds
+        .ds_to_es_valid (ds_to_es_valid ),
+        .ds_to_es_bus   (ds_to_es_bus   ),
+        //to ms
+        .es_to_ms_valid (es_to_ms_valid ),
+        .es_to_ms_bus   (es_to_ms_bus   ),
+        // data sram interface
+        // .data_sram_en   (data_sram_en   ),
+        // .data_sram_wen  (data_sram_wen  ),
+        .data_sram_req    (data_sram_req    ),
+        .data_sram_wr     (data_sram_wr     ),
+        .data_sram_size   (data_sram_size   ),
+        .data_sram_wstrb  (data_sram_wstrb  ),
+        .data_sram_addr   (data_sram_addr   ),
+        .data_sram_wdata  (data_sram_wdata  ),
+        .data_sram_addr_ok(data_sram_addr_ok),
+        .s1_vppn          (s1_vppn        ),
+        .s1_va_bit12      (s1_va_bit12    ),
+        .s1_asid          (s1_asid        ),
+        .s1_found         (s1_found       ),
+        .s1_index         (s1_index       ),
+        .s1_ppn           (s1_ppn         ),
+        .s1_ps            (s1_ps          ),
+        .s1_plv           (s1_plv         ),
+        .s1_mat           (s1_mat         ),
+        .s1_d             (s1_d           ),
+        .s1_v             (s1_v           ),
+        //
+        .invtlb_valid     (invtlb_valid   ),
+        .invtlb_op        (invtlb_op      ),
+        //
+        .exe_tlb_op       (tlb_op_bus     ),
+        .tlbsrch_hit      (tlbsrch_hit    ),
+        .csr_tlbidx_wvalue_ex(csr_tlbidx_wvalue_ex),//error
+        .csr_tlbehi_rvalue(csr_tlbehi_rvalue),
+        .csr_asid_rvalue  (csr_asid_rvalue),
+        .csr_crmd_rvalue  (csr_crmd_rvalue),
+        .csr_dmw0_rvalue  (csr_dmw0_rvalue),
+        .csr_dmw1_rvalue  (csr_dmw1_rvalue)
+        //.tlb_risk_bus     (tlb_risk_bus)
+    );
+// MEM stage
+    //0x000d0000 and d01d0000 ??
+    mem_stage mem_stage(        
+        .mem_tlb_op         (mem_tlb_op_top     ),
+        .flag_data_ok_w     (flag_data_ok_top   ),
+        .ms_pc              (mem_pc_top         ),
+        .inst_rdcntid_mem   (inst_rdcntid_mem_top),
+        .ertn_flush_mem     (ertn_flush_mem_top ),
+        .mem_ex             (mem_ex_top     ),
+        .clear_w            (clear_top      ),
+        .csr_we_mem         (csr_we_mem ),
+        .csr_num_mem        (csr_num_mem),
+        //DATA_RISK_BUS
+        .mem_waddr          (mem_waddr      ),
+        .mem_mem_result     (mem_mem_result ),
+        .clk                (aclk            ),
+        .reset              (reset          ),
+        //allowin
+        .ws_allowin         (ws_allowin     ),
+        .ms_allowin         (ms_allowin     ),
+        //from es
+        .es_to_ms_valid     (es_to_ms_valid ),
+        .ertn_flush_wb      (ertn_flush_wb_top),
+        .es_to_ms_bus       (es_to_ms_bus   ),
+        //to ws
+        .ms_to_ws_valid     (ms_to_ws_valid ),
+        .ms_to_ws_bus       (ms_to_ws_bus   ),
+        //from data-sram
+        .data_sram_data_ok  (data_sram_data_ok),
+        .data_sram_rdata    (data_sram_rdata  )
+    );
+// WB stage
+    wb_stage wb_stage(  
+            .fs_tlb_ex              (fs_tlb_ex          ),  
+            .tlb_map_stop           (tlb_map_stop         ),
+            .change_da_pg           (change_da_pg         ),
+            .wb_tlb_reflush         (wb_tlb_reflush_top   ),
+            .wb_tlb_op              (wb_tlb_op_top        ),
+            .ws_pc                  (wb_pc_top            ),
+        //to CSR    
+            //out    
+            .inst_rdcntid_wb        (inst_rdcntid_wb_top  ),
+            .csr_rvalue_eentry      (csr_rvalue_eentry_top),
+            .eentry_wb              (eentry_wb            ),
+            .wb_ex                  (wb_ex_top            ),
+            .csr_wmask_wb           (csr_wmask_wb         ),
+            .csr_we_wb              (csr_we_wb            ),
+            .csr_num_wb             (csr_num_wb           ),
+            .csr_wvalue_wb          (csr_wvalue_wb        ),
+            .ertn_era_wb            (ertn_era_wb          ),
+            .ertn_flush_wb          (ertn_flush_wb_top    ),
+            .wb_vaddr               (wb_vaddr             ),
+            .wb_pc                  (wb_pc                ),
+            .wb_ecode               (wb_ecode             ),
+            .wb_esubcode            (wb_esubcode          ),
+            //in  
+            .csr_rvalue_cntid       (csr_rvalue_cntid_top ),
+        //DATA_RISK_BUS  
+            .wb_waddr               (wb_waddr             ),
+            .clk                    (aclk                 ),
+            .reset                  (reset                ),
+            //all          
+            .ws_allowin             (ws_allowin           ),
+            //fro          
+            .ms_to_ws_valid         (ms_to_ws_valid       ),
+            .ms_to_ws_bus           (ms_to_ws_bus         ),
+            //to rf: for write       
+            .ws_to_rf_bus           (ws_to_rf_bus         ),
+            //trace debug interfa
+            .debug_wb_pc            (debug_wb_pc          ),
+            .debug_wb_rf_wen        (debug_wb_rf_wen      ),
+            .debug_wb_rf_wnum       (debug_wb_rf_wnum     ),
+            .debug_wb_rf_wdata      (debug_wb_rf_wdata    ),
+            .we                     (we                  ), //w(rite) e(nable)
+            .w_index                (w_index             ),
+            .w_e                    (w_e                 ),
+            .w_ps                   (w_ps                ),
+            .w_vppn                 (w_vppn              ),
+            .w_asid                 (w_asid              ),
+            .w_g                    (w_g                 ),
+            .w_ppn0                 (w_ppn0              ),
+            .w_plv0                 (w_plv0              ),
+            .w_mat0                 (w_mat0              ),
+            .w_d0                   (w_d0                ),
+            .w_v0                   (w_v0                ),
+            .w_ppn1                 (w_ppn1              ),
+            .w_plv1                 (w_plv1              ),
+            .w_mat1                 (w_mat1              ),
+            .w_d1                   (w_d1                ),
+            .w_v1                   (w_v1                ),
+            // read port//wb    
+            .r_index                (r_index             ),
+            .r_e                    (r_e                 ),
+            .r_vppn                 (r_vppn              ),
+            .r_ps                   (r_ps                ),
+            .r_asid                 (r_asid              ),
+            .r_g                    (r_g                 ),
+            .r_ppn0                 (r_ppn0              ),
+            .r_plv0                 (r_plv0              ),
+            .r_mat0                 (r_mat0              ),
+            .r_d0                   (r_d0                ),
+            .r_v0                   (r_v0                ),
+            .r_ppn1                 (r_ppn1              ),     
+            .r_plv1                 (r_plv1              ),
+            .r_mat1                 (r_mat1              ),
+            .r_d1                   (r_d1                ),
+            .r_v1                   (r_v1                ),
+            .tlb_refill             (tlb_refill_top      ),
+            .csr_tlbidx_rvalue      (csr_tlbidx_rvalue   ),
+            .csr_estat_rvalue       (csr_estat_rvalue    ),
+            .csr_asid_rvalue        (csr_asid_rvalue     ),
+            .csr_tlbehi_rvalue      (csr_tlbehi_rvalue   ),
+            .csr_tlbelo0_rvalue     (csr_tlbelo0_rvalue  ),
+            .csr_tlbelo1_rvalue     (csr_tlbelo1_rvalue  ),
+            .csr_tlbrd              (csr_tlbrd           ),
+            .csr_asid_wvalue        (csr_asid_wvalue     ),
+            .csr_tlbidx_wvalue      (csr_tlbidx_wvalue   ),
+            .csr_tlbelo0_wvalue     (csr_tlbelo0_wvalue  ),
+            .csr_tlbelo1_wvalue     (csr_tlbelo1_wvalue  ),
+            .csr_tlbehi_wvalue      (csr_tlbehi_wvalue   ),
+            .csr_tlbrentry_rvalue   (csr_tlbrentry_rvalue)
+    );
+
+//tlb
+tlb tlb(
+    .clk           (aclk            ),
+    // search port 0 (for fetch)
+    .s0_vppn       (s0_vppn        ),
+    .s0_va_bit12   (s0_va_bit12    ),
+    .s0_asid       (s0_asid        ),
+    .s0_found      (s0_fount       ),
+    .s0_index      (s0_index       ),
+    .s0_ppn        (s0_ppn         ),  
+    .s0_ps         (s0_ps          ),
+    .s0_plv        (s0_plv         ),
+    .s0_mat        (s0_mat         ),
+    .s0_d          (s0_d           ),
+    .s0_v          (s0_v           ),
+    // search port 1 (for load/store)
+    .s1_vppn       (s1_vppn        ),
+    .s1_va_bit12   (s1_va_bit12    ),
+    .s1_asid       (s1_asid        ),
+    .s1_found      (s1_found       ),
+    .s1_index      (s1_index       ),
+    .s1_ppn        (s1_ppn         ),
+    .s1_ps         (s1_ps          ),
+    .s1_plv        (s1_plv         ),
+    .s1_mat        (s1_mat         ),
+    .s1_d          (s1_d           ),
+    .s1_v          (s1_v           ),
+    // invtlb opcode
+    .invtlb_valid  (invtlb_valid   ),
+    .invtlb_op     (invtlb_op      ),
+    // write port//wb
+    .we            (we             ), //w(rite) e(nable)
+    .w_index       (w_index        ),
+    .w_e           (w_e            ),
+    .w_ps          (w_ps           ),
+    .w_vppn        (w_vppn         ),
+    .w_asid        (w_asid         ),
+    .w_g           (w_g            ),
+    .w_ppn0        (w_ppn0         ),
+    .w_plv0        (w_plv0         ),
+    .w_mat0        (w_mat0         ),
+    .w_d0          (w_d0           ),
+    .w_v0          (w_v0           ),
+    .w_ppn1        (w_ppn1         ),
+    .w_plv1        (w_plv1         ),
+    .w_mat1        (w_mat1         ),
+    .w_d1          (w_d1           ),
+    .w_v1          (w_v1           ),
+    // read port//wb
+    .r_index       (r_index        ),
+    .r_e           (r_e            ),
+    .r_vppn        (r_vppn         ),
+    .r_ps          (r_ps           ),
+    .r_asid        (r_asid         ),
+    .r_g           (r_g            ),
+    .r_ppn0        (r_ppn0         ),
+    .r_plv0        (r_plv0         ),
+    .r_mat0        (r_mat0         ),
+    .r_d0          (r_d0           ),
+    .r_v0          (r_v0           ),
+    .r_ppn1        (r_ppn1         ),     
+    .r_plv1        (r_plv1         ),
+    .r_mat1        (r_mat1         ),
+    .r_d1          (r_d1           ),
+    .r_v1          (r_v1           )
+);
+
+//AXI
+    axi_warp_bridge axi_warp_bridge_a(
+        .aclk             (aclk             ),
+        .aresetn          (aresetn          ),
+    
+        .inst_sram_req    (inst_sram_req    ),
+        .inst_sram_wr     (inst_sram_wr     ),
+        .inst_sram_size   (inst_sram_size   ),
+        .inst_sram_wstrb  (inst_sram_wstrb  ),
+        .inst_sram_addr   (inst_sram_addr   ),
+        .inst_sram_wdata  (inst_sram_wdata  ),
+        .inst_sram_addr_ok(inst_sram_addr_ok),
+        .inst_sram_data_ok(inst_sram_data_ok),
+        .inst_sram_rdata  (inst_sram_rdata  ), 
+    
+        .data_sram_req    (data_sram_req    ),
+        .data_sram_wr     (data_sram_wr     ),
+        .data_sram_size   (data_sram_size   ),
+        .data_sram_wstrb  (data_sram_wstrb  ),
+        .data_sram_addr   (data_sram_addr   ),
+        .data_sram_wdata  (data_sram_wdata  ),
+        .data_sram_addr_ok(data_sram_addr_ok),
+        .data_sram_data_ok(data_sram_data_ok),
+        .data_sram_rdata  (data_sram_rdata  ), 
+    
+        .arid             (arid             ),
+        .araddr           (araddr           ),
+        .arlen            (arlen            ),
+        .arsize           (arsize           ),
+        .arburst          (arburst          ),
+        .arlock           (arlock           ),
+        .arcache          (arcache          ),
+        .arprot           (arprot           ),
+        .arvalid          (arvalid          ),
+        .arready          (arready          ),
+    
+        .rid              (rid              ),
+        .rdata            (rdata            ),
+        .rresp            (rresp            ),
+        .rlast            (rlast            ),
+        .rvalid           (rvalid           ),
+        .rready           (rready           ),
+    
+        .awid             (awid             ),
+        .awaddr           (awaddr           ),
+        .awlen            (awlen            ),
+        .awsize           (awsize           ),
+        .awburst          (awburst          ),
+        .awlock           (awlock           ),
+        .awcache          (awcache          ),
+        .awprot           (awprot           ),
+        .awvalid          (awvalid          ),
+        .awready          (awready          ),
+    
+        .wid              (wid              ),
+        .wdata            (wdata            ),
+        .wstrb            (wstrb            ),
+        .wlast            (wlast            ),
+        .wvalid           (wvalid           ),
+        .wready           (wready           ),
+    
+        .bid              (bid              ),
+        .bresp            (bresp            ),
+        .bvalid           (bvalid           ),
+        .bready           (bready           )
+    );
+endmodule
